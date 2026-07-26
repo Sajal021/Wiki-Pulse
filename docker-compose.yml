@@ -1,0 +1,158 @@
+# ==============================================================================
+# WikiPulse — Phase 0: Environment Skeleton
+# ==============================================================================
+# Services:
+#   kafka          - message broker for the Wikipedia edit stream (KRaft mode,
+#                    so no separate Zookeeper container is needed)
+#   minio          - S3-compatible object storage, standing in for AWS S3
+#                    locally so dev doesn't cost real AWS money
+#   minio-init     - one-shot container that creates our buckets on startup
+#   spark-master   - Spark cluster master
+#   spark-worker   - Spark cluster worker (add more replicas later if needed)
+#   airflow        - single-container Airflow in standalone dev mode
+#   streamlit      - dashboard placeholder, will be built out in Phase 8
+# ==============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kafka (KRaft mode — acts as its own controller, no Zookeeper needed)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: wikipulse-kafka
+    ports:
+      - "9092:9092"        # client connections from host / other containers
+      - "9094:9094"        # external listener (for tools on your host machine)
+    environment:
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=controller,broker
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+      - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - wikipulse-net
+
+  # ---------------------------------------------------------------------------
+  # MinIO — local S3-compatible storage for Bronze/Silver/Gold Delta tables
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: wikipulse-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"        # S3 API
+      - "9001:9001"        # Web console
+    environment:
+      - MINIO_ROOT_USER=wikipulse
+      - MINIO_ROOT_PASSWORD=wikipulse123
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - wikipulse-net
+
+  # One-shot job: waits for MinIO, then creates our bronze/silver/gold buckets
+  minio-init:
+    image: minio/mc:latest
+    container_name: wikipulse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 wikipulse wikipulse123 &&
+      mc mb --ignore-existing local/wikipulse-bronze &&
+      mc mb --ignore-existing local/wikipulse-silver &&
+      mc mb --ignore-existing local/wikipulse-gold &&
+      echo 'Buckets ready.'
+      "
+    networks:
+      - wikipulse-net
+
+  # ---------------------------------------------------------------------------
+  # Spark cluster (master + one worker to start)
+  # ---------------------------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.5
+    container_name: wikipulse-spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "8080:8080"        # Spark master web UI
+      - "7077:7077"        # Spark master port
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - wikipulse-net
+
+  spark-worker:
+    image: apache/spark:3.5.5
+    container_name: wikipulse-spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - wikipulse-net
+
+  # ---------------------------------------------------------------------------
+  # Airflow — single-container standalone mode (fine for dev; batch DAGs only)
+  # ---------------------------------------------------------------------------
+  airflow:
+    image: apache/airflow:2.9.3
+    container_name: wikipulse-airflow
+    command: standalone
+    ports:
+      - "8081:8080"        # Airflow web UI (8080 is taken by Spark, so 8081)
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    networks:
+      - wikipulse-net
+
+  # ---------------------------------------------------------------------------
+  # Streamlit dashboard (placeholder — built out in Phase 8)
+  # ---------------------------------------------------------------------------
+  streamlit:
+    build:
+      context: ./streamlit_app
+    container_name: wikipulse-streamlit
+    ports:
+      - "8501:8501"
+    networks:
+      - wikipulse-net
+
+networks:
+  wikipulse-net:
+    driver: bridge
+
+volumes:
+  kafka_data:
+  minio_data:
