@@ -21,9 +21,10 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     container_name: wikipulse-kafka
+    restart: unless-stopped
     ports:
-      - "9092:9092"        # client connections from host / other containers
-      - "9094:9094"        # external listener (for tools on your host machine)
+      - "9092:9092" # client connections from host / other containers
+      - "9094:9094" # external listener (for tools on your host machine)
     environment:
       - KAFKA_NODE_ID=1
       - KAFKA_PROCESS_ROLES=controller,broker
@@ -38,10 +39,15 @@ services:
       - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
       - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
       - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk
+      # Keep retention small during dev — Kafka is a transient buffer here,
+      # not permanent storage. Phase 2 drains this continuously into MinIO,
+      # so we don't need Kafka holding onto days of data on disk.
+      - KAFKA_LOG_RETENTION_HOURS=24
+      - KAFKA_LOG_RETENTION_BYTES=2147483648
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      test: [ "CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list" ]
       interval: 10s
       timeout: 10s
       retries: 10
@@ -54,17 +60,18 @@ services:
   minio:
     image: minio/minio:latest
     container_name: wikipulse-minio
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"        # S3 API
-      - "9001:9001"        # Web console
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web console
     environment:
       - MINIO_ROOT_USER=wikipulse
       - MINIO_ROOT_PASSWORD=wikipulse123
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -79,13 +86,29 @@ services:
       minio:
         condition: service_healthy
     entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 wikipulse wikipulse123 &&
-      mc mb --ignore-existing local/wikipulse-bronze &&
-      mc mb --ignore-existing local/wikipulse-silver &&
-      mc mb --ignore-existing local/wikipulse-gold &&
-      echo 'Buckets ready.'
-      "
+      /bin/sh -c " mc alias set local http://minio:9000 wikipulse wikipulse123 && mc mb --ignore-existing local/wikipulse-bronze && mc mb --ignore-existing local/wikipulse-silver && mc mb --ignore-existing local/wikipulse-gold && echo 'Buckets ready.' "
+    networks:
+      - wikipulse-net
+
+  # ---------------------------------------------------------------------------
+  # Wikipedia edit stream producer (Phase 1)
+  # ---------------------------------------------------------------------------
+  producer:
+    build:
+      context: ./producer
+    container_name: wikipulse-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=wikipedia-edits
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - wikipulse-net
 
@@ -95,10 +118,11 @@ services:
   spark-master:
     image: apache/spark:3.5.5
     container_name: wikipulse-spark-master
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    restart: unless-stopped
+    command: [ "/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master" ]
     ports:
-      - "8080:8080"        # Spark master web UI
-      - "7077:7077"        # Spark master port
+      - "8080:8080" # Spark master web UI
+      - "7077:7077" # Spark master port
     volumes:
       - ./spark_jobs:/opt/spark_jobs
     networks:
@@ -107,7 +131,8 @@ services:
   spark-worker:
     image: apache/spark:3.5.5
     container_name: wikipulse-spark-worker
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    restart: unless-stopped
+    command: [ "/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077" ]
     depends_on:
       - spark-master
     environment:
@@ -119,14 +144,69 @@ services:
       - wikipulse-net
 
   # ---------------------------------------------------------------------------
+  # Bronze ingestion — Spark Structured Streaming job (Phase 2)
+  # Reads from Kafka, writes raw edits to a Delta table on MinIO
+  # ---------------------------------------------------------------------------
+  bronze-ingestion:
+    image: apache/spark:3.5.5
+    container_name: wikipulse-bronze-ingestion
+    user: "0:0"
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+      - spark_ivy_cache:/tmp/.ivy2
+    command: >
+      /opt/spark/bin/spark-submit --master spark://spark-master:7077 --conf "spark.driver.extraJavaOptions=-Divy.default.ivy.user.dir=/tmp/.ivy2" --packages io.delta:delta-spark_2.12:3.2.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /opt/spark_jobs/bronze_ingestion.py
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - wikipulse-net
+
+  # ---------------------------------------------------------------------------
+  # Jupyter — interactive PySpark notebook for exploring/cleaning data
+  # (not part of the always-on pipeline — used for ad-hoc exploration and
+  # for writing/testing Phase 3+ cleaning & quality-check logic)
+  # ---------------------------------------------------------------------------
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: wikipulse-jupyter
+    restart: unless-stopped
+    ports:
+      - "8888:8888" # Jupyter Lab
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=wikipulse
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - spark_ivy_cache:/tmp/.ivy2
+    depends_on:
+      spark-master:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - wikipulse-net
+
+  # ---------------------------------------------------------------------------
   # Airflow — single-container standalone mode (fine for dev; batch DAGs only)
   # ---------------------------------------------------------------------------
   airflow:
     image: apache/airflow:2.9.3
     container_name: wikipulse-airflow
+    restart: unless-stopped
     command: standalone
     ports:
-      - "8081:8080"        # Airflow web UI (8080 is taken by Spark, so 8081)
+      - "8081:8080" # Airflow web UI (8080 is taken by Spark, so 8081)
     environment:
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
       - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
@@ -144,6 +224,7 @@ services:
     build:
       context: ./streamlit_app
     container_name: wikipulse-streamlit
+    restart: unless-stopped
     ports:
       - "8501:8501"
     networks:
@@ -156,3 +237,4 @@ networks:
 volumes:
   kafka_data:
   minio_data:
+  spark_ivy_cache:

@@ -159,4 +159,3 @@ docker compose up -d --build
   - Live feed of flagged anomalies (e.g., *"🔴 Spike detected: Article X, edits up 8x baseline"*).
   - Trending articles chart, edit velocity time series, bot-vs-human split, and historical event log from Gold tables.
 
-
